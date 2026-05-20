@@ -14,7 +14,6 @@ from loguru import logger
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
-from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import LLMRunFrame, LLMSetToolsFrame
 from pipecat.observers.loggers.transcription_log_observer import TranscriptionLogObserver
 from pipecat.pipeline.pipeline import Pipeline
@@ -24,7 +23,7 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     AssistantTurnStoppedMessage,
     LLMContextAggregatorPair,
-    LLMUserAggregatorParams,
+    RealtimeServiceModeConfig,
     UserTurnStoppedMessage,
 )
 from pipecat.runner.types import RunnerArguments
@@ -187,7 +186,13 @@ Remember, your responses should be short. Just one or two sentences, usually. Re
 
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+        # OpenAI Realtime drives the conversation server-side and emits its
+        # own UserStarted/StoppedSpeakingFrame from server VAD events, so
+        # local VAD on the aggregator is unnecessary. realtime_service_mode
+        # decouples context writes from turn frames and transcript-bound
+        # turn-end. See `realtime-openai-local-vad.py` for the variant
+        # that disables server VAD and drives turn detection locally.
+        realtime_service_mode=RealtimeServiceModeConfig(),
     )
 
     pipeline = Pipeline(
@@ -251,15 +256,19 @@ Remember, your responses should be short. Just one or two sentences, usually. Re
         logger.info(f"Client disconnected")
         await worker.cancel()
 
-    # Log transcript updates
-    @user_aggregator.event_handler("on_user_turn_stopped")
-    async def on_user_turn_stopped(aggregator, strategy, message: UserTurnStoppedMessage):
+    # Log transcript updates. In realtime mode the turn-stopped events
+    # fire before the message text is finalized (UserTurnStoppedMessage
+    # content is None), so subscribe to the *_message_added events
+    # instead — they fire when the message is written to context and
+    # carry the finalized content.
+    @user_aggregator.event_handler("on_user_message_added")
+    async def on_user_message_added(aggregator, message: UserTurnStoppedMessage):
         timestamp = f"[{message.timestamp}] " if message.timestamp else ""
         line = f"{timestamp}user: {message.content}"
         logger.info(f"Transcript: {line}")
 
-    @assistant_aggregator.event_handler("on_assistant_turn_stopped")
-    async def on_assistant_turn_stopped(aggregator, message: AssistantTurnStoppedMessage):
+    @assistant_aggregator.event_handler("on_assistant_message_added")
+    async def on_assistant_message_added(aggregator, message: AssistantTurnStoppedMessage):
         timestamp = f"[{message.timestamp}] " if message.timestamp else ""
         line = f"{timestamp}assistant: {message.content}"
         logger.info(f"Transcript: {line}")
