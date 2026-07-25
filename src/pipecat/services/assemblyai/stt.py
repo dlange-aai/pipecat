@@ -66,6 +66,11 @@ MAX_AGENT_CONTEXT_CHARS = 1500
 # context carryover, and voice focus.
 U3_PRO_MODEL_PREFIXES = ("u3-rt-pro", "universal-3-5-pro")
 
+# Settings AssemblyAI accepts in an ``UpdateConfiguration`` message, so changing
+# them applies to the live session. Every other setting is a connect-time query
+# parameter and only takes effect on a new connection.
+HOT_UPDATABLE_SETTINGS = frozenset({"agent_context", "language_codes"})
+
 
 def is_u3_pro_model(model: str | None | _NotGiven) -> bool:
     """Return whether a model name is a Universal-3 Pro streaming variant.
@@ -132,8 +137,17 @@ class AssemblyAISTTSettings(STTSettings):
             ("en"/"es"/"fr"/"de"/"it"/"pt") steers transcription toward that
             language; other supported codes are "de", "tr", "nl", "sv", "no",
             "da", "fi", "hi", "vi", "ar", "he", "ja", "ur", "zh". Mutually
-            exclusive with ``language_detection``. Defaults to None (not sent;
-            no steering).
+            exclusive with ``language_detection``. AssemblyAI supersedes this
+            parameter with ``language_codes``, which accepts the same codes;
+            prefer that one. Defaults to None (not sent; no steering).
+        language_codes: Customer-declared audio languages as a list of ISO
+            codes, accepting the same codes as ``language_code``. A single code
+            (e.g. ``["es"]``) pins transcription to that language; several codes
+            (e.g. ``["en", "es"]``) steer toward that subset while keeping
+            code-switching among them. Mutually exclusive with
+            ``language_detection``. Unlike most settings, this one is applied to
+            a live session without reconnecting. Defaults to None (not sent; no
+            steering).
         format_turns: Whether to format transcript turns.
         speaker_labels: Enable speaker diarization.
         vad_threshold: VAD confidence threshold (0.0–1.0) for classifying
@@ -189,6 +203,7 @@ class AssemblyAISTTSettings(STTSettings):
     prompt: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
     language_detection: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
     language_code: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    language_codes: list[str] | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
     format_turns: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
     speaker_labels: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
     vad_threshold: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
@@ -300,6 +315,7 @@ class AssemblyAISTTService(WebsocketSTTService):
             prompt=None,
             language_detection=None,
             language_code=None,
+            language_codes=None,
             format_turns=True,
             speaker_labels=None,
             vad_threshold=None,
@@ -435,14 +451,26 @@ class AssemblyAISTTService(WebsocketSTTService):
                 f"for model '{default_settings.model}'."
             )
 
-        # language_code (declared language / steering) and language_detection
-        # (auto-detect) are mutually exclusive: you can't both declare a language
-        # and ask the server to detect one.
-        if default_settings.language_code is not None and default_settings.language_detection:
+        # language_code/language_codes (declared language / steering) and
+        # language_detection (auto-detect) are mutually exclusive: you can't both
+        # declare a language and ask the server to detect one.
+        declared_language_fields = [
+            name
+            for name in ("language_code", "language_codes")
+            if getattr(default_settings, name) is not None
+        ]
+        if declared_language_fields and default_settings.language_detection:
             logger.warning(
-                "language_code and language_detection are both set; these are "
-                "mutually exclusive (declaring a language vs. auto-detecting it). "
-                "Both will be sent to AssemblyAI as-is."
+                f"{' and '.join(declared_language_fields)} and language_detection are set "
+                "together; these are mutually exclusive (declaring a language vs. "
+                "auto-detecting it). All will be sent to AssemblyAI as-is."
+            )
+
+        if len(declared_language_fields) == 2:
+            logger.warning(
+                "language_code and language_codes are both set; language_codes supersedes "
+                "language_code, so set only language_codes (a single-element list such as "
+                "['es'] declares one language). Both will be sent to AssemblyAI as-is."
             )
 
         # 6. Configure pipecat turn mode (mutates default_settings)
@@ -556,9 +584,9 @@ class AssemblyAISTTService(WebsocketSTTService):
         """Apply a settings delta and apply the changes to the live session.
 
         Most settings are connection-time WebSocket query parameters, so changing
-        them reconnects. ``agent_context`` (context carryover) is the exception: it
-        is applied live via an ``UpdateConfiguration`` message and does not require
-        a reconnect.
+        them reconnects. The fields in ``HOT_UPDATABLE_SETTINGS`` are the
+        exception: they are applied live via an ``UpdateConfiguration`` message
+        and do not require a reconnect.
 
         Args:
             delta: A settings delta with updated values.
@@ -571,16 +599,19 @@ class AssemblyAISTTService(WebsocketSTTService):
         if not changed:
             return changed
 
-        if set(changed) - {"agent_context"}:
+        if set(changed) - HOT_UPDATABLE_SETTINGS:
             # A connect-time-only field changed (they become WS query params,
             # which can only be set when the connection is opened). Reconnect;
-            # the new connection's URL re-seeds any changed agent_context too.
+            # the new connection's URL re-seeds the hot-updatable fields too.
             await self._disconnect()
             await self._connect()
-        elif isinstance(self._settings.agent_context, str):
-            # agent_context alone is hot-updatable mid-stream; no reconnect
-            # needed. update_agent_context() guards on model and clips.
+            return changed
+
+        if "agent_context" in changed and isinstance(self._settings.agent_context, str):
+            # update_agent_context() guards on model and clips.
             await self.update_agent_context(self._settings.agent_context)
+        if "language_codes" in changed and isinstance(self._settings.language_codes, list):
+            await self._send_update_configuration(language_codes=self._settings.language_codes)
 
         return changed
 
@@ -710,9 +741,11 @@ class AssemblyAISTTService(WebsocketSTTService):
                 else:
                     params[k] = v
 
-        # Special handling for keyterms_prompt (needs JSON encoding)
+        # List-valued parameters travel as JSON-encoded query values.
         if s.keyterms_prompt is not None:
             params["keyterms_prompt"] = json.dumps(s.keyterms_prompt)
+        if s.language_codes is not None:
+            params["language_codes"] = json.dumps(s.language_codes)
 
         if params:
             query_string = urlencode(params)

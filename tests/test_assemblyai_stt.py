@@ -456,6 +456,77 @@ def test_language_code_with_language_detection_warns():
     assert "mutually exclusive" in sink.getvalue()
 
 
+# --- language_codes ---
+
+
+def test_language_codes_omitted_by_default():
+    # Unset means "not sent" — no steering, current behavior preserved.
+    service = AssemblyAISTTService(api_key="test-key")
+    assert "language_codes" not in _query(service)
+
+
+@pytest.mark.parametrize("codes", [["es"], ["en", "es"], ["en", "es", "fr"]])
+def test_language_codes_sent_json_encoded(codes):
+    service = AssemblyAISTTService(
+        api_key="test-key",
+        settings=AssemblyAISTTService.Settings(language_codes=codes),
+    )
+    assert _query(service)["language_codes"] == [json.dumps(codes)]
+
+
+def test_language_codes_sent_for_universal_streaming():
+    # language_codes is not U3 Pro-only; it is forwarded for any model.
+    service = AssemblyAISTTService(
+        api_key="test-key",
+        settings=AssemblyAISTTService.Settings(
+            model="universal-streaming-multilingual",
+            language_codes=["en", "es"],
+        ),
+    )
+    assert _query(service)["language_codes"] == [json.dumps(["en", "es"])]
+
+
+def test_language_codes_with_language_detection_warns():
+    # language_codes and language_detection are mutually exclusive; setting both
+    # warns but still forwards both (the server is the source of truth).
+    sink = io.StringIO()
+    handler_id = logger.add(sink, level="WARNING", format="{message}")
+    try:
+        service = AssemblyAISTTService(
+            api_key="test-key",
+            settings=AssemblyAISTTService.Settings(
+                language_codes=["es"],
+                language_detection=True,
+            ),
+        )
+    finally:
+        logger.remove(handler_id)
+    assert _query(service)["language_codes"] == [json.dumps(["es"])]
+    assert _query(service)["language_detection"] == ["true"]
+    assert "mutually exclusive" in sink.getvalue()
+
+
+def test_language_code_and_language_codes_together_warns():
+    # language_codes supersedes language_code; setting both warns but forwards
+    # both, leaving the server as the source of truth.
+    sink = io.StringIO()
+    handler_id = logger.add(sink, level="WARNING", format="{message}")
+    try:
+        service = AssemblyAISTTService(
+            api_key="test-key",
+            settings=AssemblyAISTTService.Settings(
+                language_code="es",
+                language_codes=["en", "es"],
+            ),
+        )
+    finally:
+        logger.remove(handler_id)
+    query = _query(service)
+    assert query["language_code"] == ["es"]
+    assert query["language_codes"] == [json.dumps(["en", "es"])]
+    assert "supersedes" in sink.getvalue()
+
+
 # --- prompt + keyterms_prompt ---
 
 
@@ -596,6 +667,30 @@ def test_update_settings_agent_context_not_sent_for_non_u3():
 
     # agent_context is u3-rt-pro-only; nothing goes to the server.
     assert sent == []
+    assert reconnects == []
+
+
+def test_update_settings_language_codes_only_sends_without_reconnect():
+    service = AssemblyAISTTService(api_key="test-key")
+    sent, reconnects = _stub_connection(service)
+
+    delta = AssemblyAISTTService.Settings(language_codes=["en", "es"])
+    asyncio.run(service._update_settings(delta))
+
+    # Hot update: UpdateConfiguration carries the raw list, no reconnect.
+    assert sent == [{"language_codes": ["en", "es"]}]
+    assert reconnects == []
+
+
+def test_update_settings_language_codes_with_agent_context_sends_both():
+    service = AssemblyAISTTService(api_key="test-key")
+    sent, reconnects = _stub_connection(service)
+
+    delta = AssemblyAISTTService.Settings(agent_context="Hello.", language_codes=["es"])
+    asyncio.run(service._update_settings(delta))
+
+    # Both fields are hot-updatable, so neither triggers a reconnect.
+    assert sent == [{"agent_context": "Hello."}, {"language_codes": ["es"]}]
     assert reconnects == []
 
 
