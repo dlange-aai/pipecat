@@ -9,6 +9,7 @@
 import asyncio
 import base64
 import json
+import time
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -45,6 +46,9 @@ def _server(
     word_boundaries: bool = True,
     stall_first_flush: bool = False,
     error_after_begin: dict | None = None,
+    error_once: bool = False,
+    configuration: dict | None = None,
+    expires_in: float = 3600,
 ):
     """Build a fake server following the documented Streaming TTS protocol.
 
@@ -52,24 +56,33 @@ def _server(
     ``word_boundaries`` is False) a WordBoundaries frame placing the request's
     words on the session timeline. With ``stall_first_flush`` the first request
     sends one Audio frame and then waits, so it is still in flight when the
-    client cancels it.
+    client cancels it. ``error_after_begin`` ends every session (or only the
+    first, with ``error_once``) with that Error. ``configuration`` adds keys to
+    Begin's configuration, and ``expires_in`` sets the first session's
+    expires_at; later sessions last an hour.
     """
 
     async def handler(ws):
         captured["connections"] = captured.get("connections", 0) + 1
+        captured.setdefault("connect_times", []).append(time.monotonic())
         captured["path"] = ws.request.path
         captured["auth"] = ws.request.headers.get("Authorization")
         await ws.send(
             json.dumps(
                 {
                     "type": "Begin",
-                    "id": "session-id",
-                    "expires_at": 2000000000,
-                    "configuration": {"voice": "jane", "word_boundaries": word_boundaries},
+                    "id": f"session-{captured['connections']}",
+                    "expires_at": time.time()
+                    + (expires_in if captured["connections"] == 1 else 3600),
+                    "configuration": {
+                        "voice": "jane",
+                        "word_boundaries": word_boundaries,
+                        **(configuration or {}),
+                    },
                 }
             )
         )
-        if error_after_begin:
+        if error_after_begin and not (error_once and captured["connections"] > 1):
             await ws.send(json.dumps({"type": "Error", **error_after_begin}))
             await ws.close(error_after_begin["error_code"], "See Error message for details")
             return
@@ -131,6 +144,19 @@ def _server(
                     await ws.send(json.dumps({"type": "Cancelled", "audio_duration_seconds": 0.08}))
                     flush_id += 1
                     buffer = ""
+                elif msg["type"] == "Terminate":
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "Termination",
+                                "session_duration_seconds": 0,
+                                "total_input_char_length": 0,
+                                "audio_duration_seconds": 0.0,
+                            }
+                        )
+                    )
+                    await ws.close(1000, "Session ended")
+                    return
         except websockets.ConnectionClosed:
             pass
 
@@ -173,11 +199,11 @@ async def test_speak_streams_audio_and_words():
     # The key goes in the header raw, and the session is configured in the URL.
     assert captured["auth"] == "test-key"
     query = parse_qs(urlparse(captured["path"]).query)
-    assert query["voice"] == ["jane"]
-    assert query["language"] == ["english"]
     assert query["sample_rate"] == ["24000"]
     assert query["encoding"] == ["pcm_s16le"]
-    assert [m["type"] for m in captured["messages"]] == ["Generate", "Flush"]
+    # The EndFrame ends the session with Terminate rather than dropping it.
+    assert [m["type"] for m in captured["messages"]] == ["Generate", "Flush", "Terminate"]
+    assert captured["connections"] == 1
 
 
 @pytest.mark.asyncio
@@ -275,29 +301,170 @@ async def test_interruption_after_synthesis_finished_sends_no_cancel():
     assert not _sent(captured, "Cancel")
 
 
+def _error(code: int, error_type: str | None, text: str, **fields) -> dict:
+    error = {"error_code": code, "error": text}
+    if error_type:
+        error.update(error_type=error_type, retryable=False, param=None)
+    error.update(fields)
+    return error
+
+
 @pytest.mark.asyncio
 async def test_rejected_voice_makes_the_service_unusable():
     """A voice the session can't serve fails the same way on every retry."""
     captured: dict = {"messages": []}
-    error = {"error_code": 3006, "error": "Unsupported preset voice 'nobody'."}
+    error = _error(
+        3006,
+        "invalid_request",
+        "Unsupported voice 'nobody'. Available on this connection: ['jane'].",
+        param="voice",
+    )
     async with serve(_server(captured, error_after_begin=error), "127.0.0.1", 0) as server:
         service = _service(server, settings=AssemblyAITTSService.Settings(voice="nobody"))
         _, up_frames = await run_test(service, frames_to_send=[SleepFrame(sleep=0.3)])
 
     assert not service.is_usable
-    assert any(
-        "Unsupported preset voice" in f.error for f in up_frames if isinstance(f, ErrorFrame)
-    )
+    errors = [f for f in up_frames if isinstance(f, ErrorFrame)]
+    assert any("3006 invalid_request: Unsupported voice" in f.error for f in errors)
     assert captured["connections"] == 1
 
 
-def test_language_is_derived_from_the_voice():
+@pytest.mark.asyncio
+async def test_unspeakable_text_is_not_permanent():
+    """A text the server can't split fails that text only; the service reconnects."""
+    captured: dict = {"messages": []}
+    error = _error(
+        3006,
+        "invalid_request",
+        "Text contains a 900-character segment too long to synthesize. Add spaces or punctuation.",
+    )
+    server_handler = _server(captured, error_after_begin=error, error_once=True)
+    async with serve(server_handler, "127.0.0.1", 0) as server:
+        service = _service(server, reconnect_backoff_min_wait=0, reconnect_backoff_max_wait=0)
+        _, up_frames = await run_test(service, frames_to_send=[SleepFrame(sleep=0.3)])
+
+    assert service.is_usable
+    assert any(isinstance(f, ErrorFrame) for f in up_frames)
+    assert captured["connections"] == 2
+
+
+@pytest.mark.asyncio
+async def test_error_without_error_type_falls_back_to_the_close_code():
+    """A 3006 with no error_type is reported but left to the reconnect to settle."""
+    captured: dict = {"messages": []}
+    error = _error(3006, None, "Unsupported preset voice 'nobody'.")
+    server_handler = _server(captured, error_after_begin=error, error_once=True)
+    async with serve(server_handler, "127.0.0.1", 0) as server:
+        service = _service(server)
+        _, up_frames = await run_test(service, frames_to_send=[SleepFrame(sleep=0.3)])
+
+    assert service.is_usable
+    assert any("error 3006: Unsupported" in f.error for f in up_frames if isinstance(f, ErrorFrame))
+    assert captured["connections"] == 2
+
+
+@pytest.mark.asyncio
+async def test_routine_session_end_is_not_an_error():
+    """An expired session reconnects without reporting an error."""
+    captured: dict = {"messages": []}
+    error = _error(
+        3008,
+        "session_expired",
+        "Session reached its maximum duration; open a new connection to continue",
+        retryable=True,
+    )
+    server_handler = _server(captured, error_after_begin=error, error_once=True)
+    async with serve(server_handler, "127.0.0.1", 0) as server:
+        _, up_frames = await run_test(_service(server), frames_to_send=[SleepFrame(sleep=0.3)])
+
+    assert not any(isinstance(f, ErrorFrame) for f in up_frames)
+    assert captured["connections"] == 2
+
+
+@pytest.mark.asyncio
+async def test_reconnect_waits_for_retry_after_seconds():
+    """A retryable refusal is retried no sooner than the server asks."""
+    captured: dict = {"messages": []}
+    error = _error(
+        3005,
+        "at_capacity",
+        "The TTS service is at capacity; please retry in 1 seconds.",
+        retryable=True,
+        retry_after_seconds=0.4,
+    )
+    server_handler = _server(captured, error_after_begin=error, error_once=True)
+    async with serve(server_handler, "127.0.0.1", 0) as server:
+        service = _service(server)
+        await run_test(service, frames_to_send=[SleepFrame(sleep=1.5)])
+
+    assert service.is_usable
+    assert len(captured["connect_times"]) == 2
+    first, second = captured["connect_times"]
+    assert second - first >= 0.4
+
+
+@pytest.mark.asyncio
+async def test_begin_limits_size_generate_messages():
+    """Generate texts are split at the limit Begin reports and joined as sent."""
+    captured: dict = {"messages": []}
+    limits = {"limits": {"max_generate_text_length": 8}}
+    async with serve(_server(captured, configuration=limits), "127.0.0.1", 0) as server:
+        await run_test(
+            _service(server),
+            frames_to_send=[
+                SleepFrame(sleep=0.1),
+                TTSSpeakFrame(text="Hello from AssemblyAI."),
+                SleepFrame(sleep=0.3),
+                BotStoppedSpeakingFrame(),
+            ],
+        )
+
+    generates = [m["text"] for m in _sent(captured, "Generate")]
+    assert all(len(text) <= 8 for text in generates)
+    assert "".join(generates) == "Hello from AssemblyAI."
+
+
+@pytest.mark.asyncio
+async def test_idle_session_is_kept_alive():
+    """With an inactivity timeout in effect, an idle session sends KeepAlive."""
+    captured: dict = {"messages": []}
+    config = {"inactivity_timeout": 0.2}
+    async with serve(_server(captured, configuration=config), "127.0.0.1", 0) as server:
+        await run_test(_service(server), frames_to_send=[SleepFrame(sleep=0.5)])
+
+    assert len(_sent(captured, "KeepAlive")) >= 2
+
+
+@pytest.mark.asyncio
+async def test_expiring_session_is_renewed_between_requests():
+    """A session near expires_at is replaced before the next request, keeping the turn."""
+    captured: dict = {"messages": []}
+    async with serve(_server(captured, expires_in=1.0), "127.0.0.1", 0) as server:
+        down_frames, _ = await run_test(
+            _service(server),
+            frames_to_send=[
+                TTSSpeakFrame(text="First reply."),
+                SleepFrame(sleep=0.8),
+                BotStoppedSpeakingFrame(),
+                TTSSpeakFrame(text="Second reply."),
+                SleepFrame(sleep=0.3),
+                BotStoppedSpeakingFrame(),
+            ],
+        )
+
+    assert captured["connections"] == 2
+    words = [f.text for f in down_frames if isinstance(f, TTSTextFrame)]
+    assert words == ["First", "reply.", "Second", "reply."]
+
+
+def test_language_is_sent_when_set():
     service = AssemblyAITTSService(
-        api_key="test-key", settings=AssemblyAITTSService.Settings(voice="lola")
+        api_key="test-key",
+        settings=AssemblyAITTSService.Settings(voice="jane", language=Language.ES),
     )
     service._sample_rate = 16000
     query = parse_qs(urlparse(service._build_websocket_url()).query)
-    assert query["voice"] == ["lola"]
+    assert query["voice"] == ["jane"]
     assert query["language"] == ["spanish"]
     assert query["sample_rate"] == ["16000"]
 
@@ -305,7 +472,7 @@ def test_language_is_derived_from_the_voice():
 def test_language_enum_maps_to_language_name():
     service = AssemblyAITTSService(
         api_key="test-key",
-        settings=AssemblyAITTSService.Settings(voice="juergen", language=Language.DE_DE),
+        settings=AssemblyAITTSService.Settings(language=Language.DE_DE),
     )
     assert service._settings.language == "german"
 
@@ -315,10 +482,8 @@ def test_unsupported_sample_rate_is_rejected():
         AssemblyAITTSService(api_key="test-key", sample_rate=11025)
 
 
-def test_unset_voice_is_left_to_the_server():
-    service = AssemblyAITTSService(
-        api_key="test-key", settings=AssemblyAITTSService.Settings(voice=None)
-    )
+def test_voice_and_language_are_left_to_the_server_by_default():
+    service = AssemblyAITTSService(api_key="test-key")
     service._sample_rate = 24000
     query = parse_qs(urlparse(service._build_websocket_url()).query)
     assert "voice" not in query

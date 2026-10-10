@@ -13,6 +13,7 @@ which synthesizes text into streamed PCM audio with per-word timings.
 import asyncio
 import base64
 import json
+import time
 from collections import deque
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ from websockets.protocol import State
 
 from pipecat import version as pipecat_version
 from pipecat.frames.frames import (
+    EndFrame,
     ErrorFrame,
     Frame,
     TTSAudioRawFrame,
@@ -42,28 +44,51 @@ from pipecat.utils.types import is_given
 ASSEMBLYAI_TTS_SAMPLE_RATES = (8000, 16000, 22050, 24000, 44100, 48000)
 ASSEMBLYAI_TTS_DEFAULT_SAMPLE_RATE = 24000
 
-# Longest text a single Generate message accepts, in Unicode code points.
+# Longest text a single Generate message accepts, in Unicode code points, when
+# the session's Begin doesn't report its own limit.
 MAX_GENERATE_CHARS = 2000
 
-# Every preset voice belongs to one language, and a session serves only the
-# voices of its `language` query parameter. The API has no voice-list endpoint.
-ASSEMBLYAI_TTS_VOICE_LANGUAGES = {
-    "alba": "english",
-    "anna": "english",
-    "charles": "english",
-    "eve": "english",
-    "george": "english",
-    "jane": "english",
-    "jean": "english",
-    "mary": "english",
-    "michael": "english",
-    "paul": "english",
-    "vera": "english",
-    "lola": "spanish",
-    "juergen": "german",
-    "giovanni": "italian",
-    "rafael": "portuguese",
-    "estelle": "french",
+# How long before a session's expires_at to replace it between requests, at
+# most half the session's length. The server stops reading text at expires_at,
+# which would cut off a reply that straddles it.
+SESSION_RENEWAL_MARGIN_S = 120.0
+
+# How long a graceful stop waits for Termination after sending Terminate.
+TERMINATE_TIMEOUT_S = 2.0
+
+# Error types the server reports when it ends a session for a routine reason.
+# The receive loop reconnects, so they aren't errors.
+ROUTINE_ERROR_TYPES = frozenset({"inactivity_timeout", "session_expired", "service_restart"})
+ROUTINE_ERROR_CODES = frozenset({1012, 3008})
+
+# Error type -> category. INVALID_REQUEST and AUTHENTICATION are permanent and
+# leave the service unusable, so they're kept for errors in the session's own
+# configuration. A refused voice or language is one too; see _classify_error.
+# A refused frame or text concerns that text only.
+ERROR_TYPES: dict[str, ErrorCategory] = {
+    "unauthorized": ErrorCategory.AUTHENTICATION,
+    "insufficient_funds": ErrorCategory.QUOTA,
+    "invalid_parameter": ErrorCategory.INVALID_REQUEST,
+    "invalid_message": ErrorCategory.UNKNOWN,
+    "invalid_request": ErrorCategory.UNKNOWN,
+    "rate_limited": ErrorCategory.RATE_LIMIT,
+    "input_rate_exceeded": ErrorCategory.RATE_LIMIT,
+    "auth_unavailable": ErrorCategory.SERVER,
+    "at_capacity": ErrorCategory.SERVER,
+    "upstream_unavailable": ErrorCategory.SERVER,
+    "voice_service_unavailable": ErrorCategory.SERVER,
+    "internal_error": ErrorCategory.SERVER,
+}
+
+# Close code -> category, for an Error whose error_type is missing or unknown.
+# A 3006 covers both bad parameters and idle timeouts, so it's left to the
+# reconnect to tell them apart: a bad parameter fails again at once.
+ERROR_CODES: dict[int, ErrorCategory] = {
+    1008: ErrorCategory.AUTHENTICATION,
+    1011: ErrorCategory.SERVER,
+    3005: ErrorCategory.SERVER,
+    3009: ErrorCategory.RATE_LIMIT,
+    3010: ErrorCategory.RATE_LIMIT,
 }
 
 # How long to wait, after a turn's last FlushDone, for the WordBoundaries frame
@@ -100,10 +125,11 @@ def language_to_assemblyai_tts_language(language: Language) -> str:
 class AssemblyAITTSSettings(TTSSettings):
     """Settings for AssemblyAITTSService.
 
-    ``voice`` is a preset voice name (lowercase, case-sensitive) and
-    ``language`` is the language the session serves. When ``language`` is
-    unset it is derived from the voice. AssemblyAI has no model selection, so
-    ``model`` is unused.
+    ``voice`` is an AssemblyAI voice name (case-insensitive), and ``language``
+    is the language the session speaks, ``english`` when unset. The language
+    picks the session's model, which must speak the voice in that language;
+    when ``voice`` is unset the server uses that model's default voice.
+    AssemblyAI has no model selection, so ``model`` is unused.
     """
 
     pass
@@ -140,17 +166,16 @@ class AssemblyAITTSService(WebsocketTTSService):
 
     Streams text to AssemblyAI over a single WebSocket session and plays the
     audio as it arrives. Each sentence is sent as its own request (a
-    ``Generate`` followed by a ``Flush``), which is how the API expects
-    streamed LLM text. Interruptions send ``Cancel``, which keeps the session
-    open, and per-word timings drive word-level ``TTSTextFrame`` output.
-
-    With ``TextAggregationMode.TOKEN`` the turn's text is flushed only when
-    the turn ends, so a reply starts playing early only once it reaches about
-    200 characters of complete sentences, the point where the server begins
-    speaking on its own. The default sentence aggregation is recommended.
+    ``Generate`` followed by a ``Flush``). With ``TextAggregationMode.TOKEN``
+    the turn's text streams as it is generated and is flushed when the turn
+    ends; the server starts speaking once the first sentence is complete.
+    Interruptions send ``Cancel``, which keeps the session open, and per-word
+    timings drive word-level ``TTSTextFrame`` output.
 
     The session's voice, language and sample rate are fixed at connect time,
-    so changing the voice or language reconnects.
+    so changing the voice or language reconnects. A session lasts at most an
+    hour; the service replaces it between requests before it expires, and
+    keeps an idle session open when the account sets an inactivity timeout.
 
     Example::
 
@@ -175,7 +200,8 @@ class AssemblyAITTSService(WebsocketTTSService):
         """Initialize the AssemblyAI TTS service.
 
         Args:
-            api_key: AssemblyAI API key.
+            api_key: AssemblyAI API key, or a temporary token minted with
+                ``product=tts``.
             url: Streaming TTS WebSocket URL. Use
                 ``wss://streaming-tts.us.assemblyai.com/v1/ws`` or
                 ``wss://streaming-tts.eu.assemblyai.com/v1/ws`` to keep text and
@@ -197,7 +223,7 @@ class AssemblyAITTSService(WebsocketTTSService):
 
         default_settings = self.Settings(
             model=None,
-            voice="jane",
+            voice=None,
             language=None,
         )
 
@@ -218,9 +244,23 @@ class AssemblyAITTSService(WebsocketTTSService):
         self._url = url
 
         self._receive_task: asyncio.Task | None = None
+        self._keepalive_task: asyncio.Task | None = None
+
+        # Session state reported by Begin.
         self._session_id: str | None = None
-        # Whether the session will send WordBoundaries, as echoed by Begin.
+        # When to replace the session, ahead of its expires_at.
+        self._renew_at: float | None = None
+        self._max_generate_chars = MAX_GENERATE_CHARS
+        # Whether the session will send WordBoundaries.
         self._word_boundaries = False
+
+        # When the last client frame was sent, for the keepalive.
+        self._last_send_time = 0.0
+        # Set by Termination while a graceful stop waits for it.
+        self._termination: asyncio.Event | None = None
+        self._ending = False
+        # The wait an Error asked for before the next connection attempt.
+        self._reconnect_delay = 0.0
 
         # Requests the server has not finished, oldest first. The server works
         # through them in order and never interleaves their audio, so audio and
@@ -288,21 +328,28 @@ class AssemblyAITTSService(WebsocketTTSService):
             self._warn_unhandled_updated_settings(changed)
         return changed
 
+    async def stop(self, frame: EndFrame):
+        """Stop the service, ending the session with ``Terminate``.
+
+        Args:
+            frame: The end frame.
+        """
+        self._ending = True
+        await super().stop(frame)
+
     def _build_websocket_url(self) -> str:
         """Build the connect URL, which carries the whole session configuration."""
         voice = self._settings.voice
         language = self._settings.language
-        if not (is_given(language) and language):
-            language = ASSEMBLYAI_TTS_VOICE_LANGUAGES.get(str(voice))
         params: dict[str, Any] = {
             "sample_rate": self.sample_rate,
             "encoding": "pcm_s16le",
             "word_boundaries": "true",
         }
-        # Without a voice the server uses the language's default voice.
+        # The server falls back to its default voice and to English.
         if voice:
             params["voice"] = voice
-        if language:
+        if is_given(language) and language:
             params["language"] = language
         return f"{self._url}?{urlencode(params)}"
 
@@ -313,17 +360,72 @@ class AssemblyAITTSService(WebsocketTTSService):
     async def _connect(self):
         """Connect to AssemblyAI and start the receive task."""
         await super()._connect()
+        self._reconnect_delay = 0.0
+        await self._open_session()
+
+    async def _disconnect(self):
+        """Disconnect from AssemblyAI and stop the receive task."""
+        if self._ending:
+            await self._terminate_session()
+        await super()._disconnect()
+        await self.stop_all_metrics()
+        await self._close_session()
+
+    async def _open_session(self):
+        """Open a session and start reading it."""
         await self._connect_websocket()
         if self._websocket and not self._receive_task:
             self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
 
-    async def _disconnect(self):
-        """Disconnect from AssemblyAI and stop the receive task."""
-        await super()._disconnect()
+    async def _close_session(self):
+        """Stop reading the session and close it."""
         if self._receive_task:
             await self.cancel_task(self._receive_task, timeout=1.0)
             self._receive_task = None
         await self._disconnect_websocket()
+
+    async def _renew_session_if_expiring(self):
+        """Replace the session ahead of its expiry, while nothing is in flight.
+
+        Audio contexts stay open, so a turn in progress carries on in the new
+        session.
+        """
+        if self._renew_at is None or self._requests or self._flush_offsets:
+            return
+        if time.time() < self._renew_at:
+            return
+        logger.debug(f"{self}: session {self._session_id} expires soon; opening a new one")
+        await self._close_session()
+        await self._open_session()
+
+    async def _terminate_session(self):
+        """End the session with Terminate and wait briefly for its Termination."""
+        if not self._websocket or self._websocket.state is not State.OPEN:
+            return
+        # The server closes the socket after Termination; that is not a drop
+        # to reconnect from.
+        self._disconnecting = True
+        self._termination = asyncio.Event()
+        try:
+            await self._send({"type": "Terminate"})
+            await asyncio.wait_for(self._termination.wait(), timeout=TERMINATE_TIMEOUT_S)
+        except Exception as e:
+            logger.debug(f"{self}: no Termination after Terminate: {e!r}")
+        finally:
+            self._termination = None
+
+    async def _reconnect_websocket(self, attempt_number: int) -> bool:
+        """Reconnect, first waiting as long as the last Error asked.
+
+        The lost session's contexts are closed before the wait, so a turn cut
+        off by the error ends rather than holding the pipeline.
+        """
+        await self._close_connection_contexts()
+        if self._reconnect_delay:
+            delay, self._reconnect_delay = self._reconnect_delay, 0.0
+            logger.debug(f"{self}: waiting {delay} s before reconnecting, as the server asked")
+            await asyncio.sleep(delay)
+        return await super()._reconnect_websocket(attempt_number)
 
     async def _connect_websocket(self):
         """Open the WebSocket session."""
@@ -334,7 +436,7 @@ class AssemblyAITTSService(WebsocketTTSService):
             url = self._build_websocket_url()
             logger.debug(f"{self}: connecting to {url}")
             headers = {
-                # The key is sent raw: a "Bearer " prefix is rejected.
+                # Without a "Bearer " prefix, which not every deployment accepts.
                 "Authorization": self._api_key,
                 "User-Agent": f"AssemblyAI/1.0 (integration=Pipecat/{pipecat_version()})",
             }
@@ -348,7 +450,6 @@ class AssemblyAITTSService(WebsocketTTSService):
     async def _disconnect_websocket(self):
         """Close the WebSocket session and forget its state."""
         try:
-            await self.stop_all_metrics()
             if self._websocket and self._websocket.state is State.OPEN:
                 logger.debug(f"{self}: disconnecting")
                 # Closing without Terminate discards synthesis still in flight,
@@ -363,15 +464,22 @@ class AssemblyAITTSService(WebsocketTTSService):
 
     async def _reset_session_state(self):
         """Forget per-session state, which a new session doesn't carry over."""
-        for state in self._contexts.values():
-            if state.grace_task:
-                await self.cancel_task(state.grace_task)
-        self._contexts.clear()
+        if self._keepalive_task:
+            await self.cancel_task(self._keepalive_task)
+            self._keepalive_task = None
         self._requests.clear()
         self._flush_offsets.clear()
         self._cancels_pending = 0
         self._session_id = None
+        self._renew_at = None
+        self._max_generate_chars = MAX_GENERATE_CHARS
         self._word_boundaries = False
+
+    async def _close_connection_contexts(self):
+        """Forget the bookkeeping of the contexts a replaced connection closes."""
+        for context_id in list(self._contexts):
+            await self._forget_context(context_id)
+        await super()._close_connection_contexts()
 
     def _get_websocket(self):
         """Return the active WebSocket connection or raise if disconnected."""
@@ -386,6 +494,20 @@ class AssemblyAITTSService(WebsocketTTSService):
             message: The message to serialize and send.
         """
         await self._get_websocket().send(json.dumps(message))
+        self._last_send_time = time.monotonic()
+
+    async def _keepalive_task_handler(self, interval: float):
+        """Send KeepAlive whenever the session has been idle for ``interval``."""
+        while True:
+            remaining = interval - (time.monotonic() - self._last_send_time)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+                continue
+            try:
+                await self._send({"type": "KeepAlive"})
+            except Exception as e:
+                logger.debug(f"{self}: keepalive stopped: {e!r}")
+                return
 
     # ------------------------------------------------------------------
     # Requests and audio contexts
@@ -435,7 +557,8 @@ class AssemblyAITTSService(WebsocketTTSService):
             state.awaiting_words.clear()
             await self._close_context(context_id)
 
-    async def _close_context(self, context_id: str):
+    async def _forget_context(self, context_id: str):
+        """Drop a context's bookkeeping, including WordBoundaries still due for it."""
         state = self._contexts.pop(context_id, None)
         if state and state.grace_task:
             await self.cancel_task(state.grace_task)
@@ -444,6 +567,9 @@ class AssemblyAITTSService(WebsocketTTSService):
             for flush_id, offset in self._flush_offsets.items()
             if offset[0] != context_id
         }
+
+    async def _close_context(self, context_id: str):
+        await self._forget_context(context_id)
         if self.audio_context_available(context_id):
             await self.append_to_audio_context(context_id, TTSStoppedFrame(context_id=context_id))
             await self.remove_audio_context(context_id)
@@ -490,9 +616,7 @@ class AssemblyAITTSService(WebsocketTTSService):
                     await self._send({"type": "Cancel"})
                 except Exception as e:
                     logger.warning(f"{self}: error sending Cancel: {e}")
-        state = self._contexts.pop(context_id, None)
-        if state and state.grace_task:
-            await self.cancel_task(state.grace_task)
+        await self._forget_context(context_id)
         await super().on_audio_context_interrupted(context_id)
 
     # ------------------------------------------------------------------
@@ -530,15 +654,32 @@ class AssemblyAITTSService(WebsocketTTSService):
                 await self._handle_error(msg)
             elif msg_type == "Termination":
                 logger.debug(f"{self}: session terminated: {msg}")
+                if self._termination:
+                    self._termination.set()
             else:
                 # The protocol may add frame types, which are safe to ignore.
                 logger.trace(f"{self}: unhandled message: {msg}")
 
     def _handle_begin(self, msg: dict):
-        configuration = msg.get("configuration", {})
+        configuration = msg.get("configuration") or {}
+        limits = configuration.get("limits") or {}
         self._session_id = msg.get("id")
+        expires_at = msg.get("expires_at")
+        if expires_at:
+            margin = min(SESSION_RENEWAL_MARGIN_S, (expires_at - time.time()) / 2)
+            self._renew_at = expires_at - margin
+        self._max_generate_chars = limits.get("max_generate_text_length") or MAX_GENERATE_CHARS
         self._word_boundaries = configuration.get("word_boundaries") is True
         logger.debug(f"{self}: session {self._session_id} started: {configuration}")
+
+        # An account can set an idle timeout the client didn't ask for.
+        inactivity_timeout = configuration.get("inactivity_timeout")
+        if inactivity_timeout and not self._keepalive_task:
+            self._last_send_time = time.monotonic()
+            self._keepalive_task = self.create_task(
+                self._keepalive_task_handler(inactivity_timeout / 2),
+                f"{self}::keepalive",
+            )
 
     async def _handle_audio(self, msg: dict):
         if self._cancels_pending or not self._requests:
@@ -598,32 +739,36 @@ class AssemblyAITTSService(WebsocketTTSService):
     async def _handle_error(self, msg: dict):
         """Report an Error frame. The server closes the session right after it.
 
-        A rejected credential or a bad request (including an unknown voice)
-        fails identically on every retry, so those leave the service unusable.
-        The session reaching its maximum duration is routine; the receive loop
-        reconnects when the server closes.
+        A rejected credential, voice or parameter fails identically on every
+        retry, so its category leaves the service unusable. Transient failures are
+        retried by the receive loop's reconnect, after any wait the server
+        asks for.
         """
         code = msg.get("error_code")
-        error = msg.get("error", "")
-        text = f"AssemblyAI TTS error {code}: {error}"
-        if code == 3008:
+        error_type = msg.get("error_type")
+        label = f"{code} {error_type}" if error_type else f"{code}"
+        text = f"AssemblyAI TTS error {label}: {msg.get('error', '')}"
+
+        retry_after = msg.get("retry_after_seconds")
+        if retry_after:
+            self._reconnect_delay = float(retry_after)
+        if error_type in ROUTINE_ERROR_TYPES or (not error_type and code in ROUTINE_ERROR_CODES):
             logger.debug(f"{self}: {text}")
-        elif code == 1008:
-            await self.push_error(
-                error_msg=text,
-                category=ErrorCategory.AUTHENTICATION,
-                force_treat_as_permanent=True,
-            )
-        elif code == 3006 and not error.startswith("No message received"):
-            await self.push_error(
-                error_msg=text,
-                category=ErrorCategory.INVALID_REQUEST,
-                force_treat_as_permanent=True,
-            )
-        elif code in (3009, 3010):
-            await self.push_error(error_msg=text, category=ErrorCategory.RATE_LIMIT)
-        else:
-            await self.push_error(error_msg=text)
+            return
+
+        category = self._classify_error(code, error_type, msg.get("param"))
+        await self.push_error(error_msg=text, category=category)
+
+    @staticmethod
+    def _classify_error(
+        code: int | None, error_type: str | None, param: str | None
+    ) -> ErrorCategory:
+        """Return the category of an Error frame."""
+        if error_type == "invalid_request" and param in ("voice", "language"):
+            return ErrorCategory.INVALID_REQUEST
+        if error_type in ERROR_TYPES:
+            return ERROR_TYPES[error_type]
+        return ERROR_CODES.get(code or 0, ErrorCategory.UNKNOWN)
 
     # ------------------------------------------------------------------
     # TTS generation
@@ -634,8 +779,8 @@ class AssemblyAITTSService(WebsocketTTSService):
         """Send text to AssemblyAI for synthesis.
 
         Audio arrives on the receive task. In sentence aggregation each call is
-        flushed as its own request, since text shorter than about 200
-        characters is not spoken until it is flushed.
+        flushed as its own request, since only a flush guarantees the server
+        speaks all of the text.
 
         Args:
             text: The text to synthesize.
@@ -644,9 +789,17 @@ class AssemblyAITTSService(WebsocketTTSService):
         Yields:
             Frame: None, as audio arrives via the WebSocket receive task.
         """
+        if self._reconnect_in_progress:
+            # The receive loop owns the connection until it reconnects.
+            yield ErrorFrame(error="AssemblyAI TTS is reconnecting; text not spoken")
+            yield TTSStoppedFrame(context_id=context_id)
+            return
+
         try:
             if not self._websocket or self._websocket.state is State.CLOSED:
                 await self._connect()
+            else:
+                await self._renew_session_if_expiring()
 
             # Registered before sending, so audio that arrives while the
             # messages are still being sent is attributed to this context.
@@ -655,10 +808,10 @@ class AssemblyAITTSService(WebsocketTTSService):
             if flush:
                 request.flushed = True
 
-            for start in range(0, len(text), MAX_GENERATE_CHARS):
-                await self._send(
-                    {"type": "Generate", "text": text[start : start + MAX_GENERATE_CHARS]}
-                )
+            # Consecutive Generate texts are joined exactly as sent.
+            size = self._max_generate_chars
+            for start in range(0, len(text), size):
+                await self._send({"type": "Generate", "text": text[start : start + size]})
             if flush:
                 await self._send({"type": "Flush"})
 
