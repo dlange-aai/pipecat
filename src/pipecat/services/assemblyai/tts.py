@@ -200,8 +200,9 @@ class AssemblyAITTSService(WebsocketTTSService):
         """Initialize the AssemblyAI TTS service.
 
         Args:
-            api_key: AssemblyAI API key, or a temporary token minted with
-                ``product=tts``.
+            api_key: AssemblyAI API key. A temporary token opens a single
+                session, so it can't carry the service's reconnects and
+                session renewals.
             url: Streaming TTS WebSocket URL. Use
                 ``wss://streaming-tts.us.assemblyai.com/v1/ws`` or
                 ``wss://streaming-tts.eu.assemblyai.com/v1/ws`` to keep text and
