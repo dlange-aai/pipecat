@@ -17,7 +17,7 @@ import time
 from collections import deque
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 from urllib.parse import urlencode
 
 from loguru import logger
@@ -37,7 +37,7 @@ from pipecat.services.tts_service import WebsocketTTSService
 from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.errors import ErrorCategory
 from pipecat.utils.tracing.service_decorators import traced_tts
-from pipecat.utils.types import is_given
+from pipecat.utils.types import NOT_GIVEN, NotGiven, is_given
 
 # Sample rates the API can stream. 24 kHz is the model's native rate; any other
 # is resampled on the server.
@@ -78,6 +78,14 @@ ERROR_TYPES: dict[str, ErrorCategory] = {
     "upstream_unavailable": ErrorCategory.SERVER,
     "voice_service_unavailable": ErrorCategory.SERVER,
     "internal_error": ErrorCategory.SERVER,
+    # A custom voice or model the session can't use.
+    "feature_not_enabled": ErrorCategory.INVALID_REQUEST,
+    "model_not_found": ErrorCategory.INVALID_REQUEST,
+    "model_retired": ErrorCategory.INVALID_REQUEST,
+    "voice_not_found": ErrorCategory.INVALID_REQUEST,
+    "voice_expired": ErrorCategory.INVALID_REQUEST,
+    "voice_blocked": ErrorCategory.INVALID_REQUEST,
+    "voice_not_paired": ErrorCategory.INVALID_REQUEST,
 }
 
 # Close code -> category, for an Error whose error_type is missing or unknown.
@@ -129,10 +137,18 @@ class AssemblyAITTSSettings(TTSSettings):
     is the language the session speaks, ``english`` when unset. The language
     picks the session's model, which must speak the voice in that language;
     when ``voice`` is unset the server uses that model's default voice.
-    AssemblyAI has no model selection, so ``model`` is unused.
+
+    Parameters:
+        voice_id: A custom or public voice from the Voices API, by its ``id``
+            or slug, used instead of ``voice``. The session speaks the voice's
+            own language when ``language`` is unset, and ``model`` must be one
+            the voice is paired with.
     """
 
-    pass
+    voice_id: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+
+    # The base class reads a ``voice_id`` key as ``voice``; here it is its own setting.
+    _aliases: ClassVar[dict[str, str]] = {}
 
 
 @dataclass
@@ -172,8 +188,12 @@ class AssemblyAITTSService(WebsocketTTSService):
     Interruptions send ``Cancel``, which keeps the session open, and per-word
     timings drive word-level ``TTSTextFrame`` output.
 
-    The session's voice, language and sample rate are fixed at connect time,
-    so changing the voice or language reconnects. A session lasts at most an
+    ``Settings.model`` selects the model by its dated name, such as
+    ``assemblyai-tts-mul-4b-2026-10-07``, or an alias such as ``latest``;
+    unset, the session runs on the default model of its language.
+
+    The session's voice, language, model and sample rate are fixed at connect
+    time, so changing any of them reconnects. A session lasts at most an
     hour; the service replaces it between requests before it expires, and
     keeps an idle session open when the account sets an inactivity timeout.
 
@@ -225,6 +245,7 @@ class AssemblyAITTSService(WebsocketTTSService):
         default_settings = self.Settings(
             model=None,
             voice=None,
+            voice_id=None,
             language=None,
         )
 
@@ -313,7 +334,7 @@ class AssemblyAITTSService(WebsocketTTSService):
         await self._connect()
 
     async def _update_settings(self, delta: TTSSettings) -> dict[str, Any]:
-        """Apply a settings delta, reconnecting if the voice or language changed.
+        """Apply a settings delta, reconnecting if the session's configuration changed.
 
         Args:
             delta: A :class:`TTSSettings` (or ``AssemblyAITTSService.Settings``) delta.
@@ -322,7 +343,7 @@ class AssemblyAITTSService(WebsocketTTSService):
             Dict mapping changed field names to their previous values.
         """
         changed = await super()._update_settings(delta)
-        if "voice" in changed or "language" in changed:
+        if changed.keys() & {"voice", "voice_id", "language", "model"}:
             await self._disconnect()
             await self._connect()
         else:
@@ -341,17 +362,28 @@ class AssemblyAITTSService(WebsocketTTSService):
     def _build_websocket_url(self) -> str:
         """Build the connect URL, which carries the whole session configuration."""
         voice = self._settings.voice
+        voice_id = self._settings.voice_id
         language = self._settings.language
+        model = self._settings.model
         params: dict[str, Any] = {
             "sample_rate": self.sample_rate,
             "encoding": "pcm_s16le",
             "word_boundaries": "true",
         }
-        # The server falls back to its default voice and to English.
-        if voice:
+        # The server falls back to its default voice, model and language. It
+        # refuses a session given both voice and voice_id.
+        if is_given(voice_id) and voice_id:
+            if voice:
+                logger.warning(
+                    f"{self}: voice_id {voice_id!r} is set, so voice {voice!r} is unused"
+                )
+            params["voice_id"] = voice_id
+        elif voice:
             params["voice"] = voice
         if is_given(language) and language:
             params["language"] = language
+        if is_given(model) and model:
+            params["model_id"] = model
         return f"{self._url}?{urlencode(params)}"
 
     # ------------------------------------------------------------------
@@ -765,7 +797,7 @@ class AssemblyAITTSService(WebsocketTTSService):
         code: int | None, error_type: str | None, param: str | None
     ) -> ErrorCategory:
         """Return the category of an Error frame."""
-        if error_type == "invalid_request" and param in ("voice", "language"):
+        if error_type == "invalid_request" and param in ("voice", "voice_id", "language"):
             return ErrorCategory.INVALID_REQUEST
         if error_type in ERROR_TYPES:
             return ERROR_TYPES[error_type]

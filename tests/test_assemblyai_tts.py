@@ -488,3 +488,56 @@ def test_voice_and_language_are_left_to_the_server_by_default():
     query = parse_qs(urlparse(service._build_websocket_url()).query)
     assert "voice" not in query
     assert "language" not in query
+
+
+def test_custom_voice_and_model_are_sent():
+    service = AssemblyAITTSService(
+        api_key="test-key",
+        settings=AssemblyAITTSService.Settings(
+            voice_id="01a142a4-66f3-7315-b15f-668b6edfb595",
+            model="assemblyai-tts-mul-4b-2026-10-07",
+        ),
+    )
+    service._sample_rate = 24000
+    query = parse_qs(urlparse(service._build_websocket_url()).query)
+    assert query["voice_id"] == ["01a142a4-66f3-7315-b15f-668b6edfb595"]
+    assert query["model_id"] == ["assemblyai-tts-mul-4b-2026-10-07"]
+    assert "voice" not in query
+    assert "language" not in query
+
+
+def test_voice_id_wins_over_voice():
+    service = AssemblyAITTSService(
+        api_key="test-key",
+        settings=AssemblyAITTSService.Settings(voice="jane", voice_id="support-agent-emma"),
+    )
+    service._sample_rate = 24000
+    query = parse_qs(urlparse(service._build_websocket_url()).query)
+    assert query["voice_id"] == ["support-agent-emma"]
+    assert "voice" not in query
+
+
+def test_voice_id_key_sets_the_custom_voice():
+    delta = AssemblyAITTSService.Settings.from_mapping({"voice_id": "support-agent-emma"})
+    assert delta.voice_id == "support-agent-emma"
+    assert delta.given_fields().keys() == {"voice_id"}
+
+
+@pytest.mark.asyncio
+async def test_missing_custom_voice_makes_the_service_unusable():
+    """A custom voice that can't be found fails the same way on every retry."""
+    captured: dict = {"messages": []}
+    error = _error(
+        3012,
+        "voice_not_found",
+        "The requested voice was not found.",
+        param="voice_id",
+    )
+    async with serve(_server(captured, error_after_begin=error), "127.0.0.1", 0) as server:
+        service = _service(server, settings=AssemblyAITTSService.Settings(voice_id="nobody"))
+        _, up_frames = await run_test(service, frames_to_send=[SleepFrame(sleep=0.3)])
+
+    assert not service.is_usable
+    errors = [f for f in up_frames if isinstance(f, ErrorFrame)]
+    assert any("3012 voice_not_found" in f.error for f in errors)
+    assert captured["connections"] == 1
