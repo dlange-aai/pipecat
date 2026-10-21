@@ -65,7 +65,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     tts = AssemblyAITTSService(
         api_key=os.environ["ASSEMBLYAI_API_KEY"],
         settings=AssemblyAITTSService.Settings(
-            voice=os.getenv("ASSEMBLYAI_TTS_VOICE", "jane"),
+            voice=os.getenv("ASSEMBLYAI_VOICE_ID"),
         ),
     )
 

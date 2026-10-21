@@ -46,6 +46,7 @@ def _server(
     word_boundaries: bool = True,
     stall_first_flush: bool = False,
     error_after_begin: dict | None = None,
+    error_before_begin: dict | None = None,
     error_once: bool = False,
     configuration: dict | None = None,
     expires_in: float = 3600,
@@ -57,7 +58,8 @@ def _server(
     words on the session timeline. With ``stall_first_flush`` the first request
     sends one Audio frame and then waits, so it is still in flight when the
     client cancels it. ``error_after_begin`` ends every session (or only the
-    first, with ``error_once``) with that Error. ``configuration`` adds keys to
+    first, with ``error_once``) with that Error; ``error_before_begin`` refuses
+    every session with it in place of Begin. ``configuration`` adds keys to
     Begin's configuration, and ``expires_in`` sets the first session's
     expires_at; later sessions last an hour.
     """
@@ -67,6 +69,10 @@ def _server(
         captured.setdefault("connect_times", []).append(time.monotonic())
         captured["path"] = ws.request.path
         captured["auth"] = ws.request.headers.get("Authorization")
+        if error_before_begin:
+            await ws.send(json.dumps({"type": "Error", **error_before_begin}))
+            await ws.close(error_before_begin["error_code"], "See Error message for details")
+            return
         await ws.send(
             json.dumps(
                 {
@@ -103,6 +109,8 @@ def _server(
                     if stalled:
                         stalled = False
                         await ws.send(json.dumps(frame))
+                        # Cancelled audio still holds its place on the timeline.
+                        session_ms += CHUNK_MS
                         buffer = ""
                         continue
                     await ws.send(json.dumps(frame))
@@ -201,8 +209,7 @@ async def test_speak_streams_audio_and_words():
     query = parse_qs(urlparse(captured["path"]).query)
     assert query["sample_rate"] == ["24000"]
     assert query["encoding"] == ["pcm_s16le"]
-    # The EndFrame ends the session with Terminate rather than dropping it.
-    assert [m["type"] for m in captured["messages"]] == ["Generate", "Flush", "Terminate"]
+    assert [m["type"] for m in captured["messages"]] == ["Generate", "Flush"]
     assert captured["connections"] == 1
 
 
@@ -231,7 +238,7 @@ async def test_llm_turn_flushes_each_sentence_into_one_context():
     assert sum(isinstance(f, TTSStoppedFrame) for f in down_frames) == 1
     word_frames = [f for f in down_frames if isinstance(f, TTSTextFrame)]
     assert [f.text for f in word_frames] == tokens
-    # Later requests are offset by the audio of the earlier ones in the turn.
+    # Word times are on the session's timeline, measured from the turn's first audio.
     pts = [f.pts for f in word_frames]
     assert pts == sorted(pts)
     assert pts[2] - pts[0] == CHUNK_MS * 2 * 1_000_000
@@ -319,7 +326,7 @@ async def test_rejected_voice_makes_the_service_unusable():
         "Unsupported voice 'nobody'. Available on this connection: ['jane'].",
         param="voice",
     )
-    async with serve(_server(captured, error_after_begin=error), "127.0.0.1", 0) as server:
+    async with serve(_server(captured, error_before_begin=error), "127.0.0.1", 0) as server:
         service = _service(server, settings=AssemblyAITTSService.Settings(voice="nobody"))
         _, up_frames = await run_test(service, frames_to_send=[SleepFrame(sleep=0.3)])
 
@@ -349,8 +356,22 @@ async def test_unspeakable_text_is_not_permanent():
 
 
 @pytest.mark.asyncio
-async def test_error_without_error_type_falls_back_to_the_close_code():
-    """A 3006 with no error_type is reported but left to the reconnect to settle."""
+async def test_rejected_key_makes_the_service_unusable():
+    """A credential refused before Begin fails the same way on every retry."""
+    captured: dict = {"messages": []}
+    error = _error(1008, "unauthorized", "Unauthorized: Invalid API key")
+    async with serve(_server(captured, error_before_begin=error), "127.0.0.1", 0) as server:
+        service = _service(server)
+        _, up_frames = await run_test(service, frames_to_send=[SleepFrame(sleep=0.3)])
+
+    assert not service.is_usable
+    assert any("1008 unauthorized" in f.error for f in up_frames if isinstance(f, ErrorFrame))
+    assert captured["connections"] == 1
+
+
+@pytest.mark.asyncio
+async def test_error_without_error_type_after_begin_is_not_permanent():
+    """An error after Begin is reported but left to the reconnect to settle."""
     captured: dict = {"messages": []}
     error = _error(3006, None, "Unsupported preset voice 'nobody'.")
     server_handler = _server(captured, error_after_begin=error, error_once=True)
@@ -425,17 +446,6 @@ async def test_begin_limits_size_generate_messages():
 
 
 @pytest.mark.asyncio
-async def test_idle_session_is_kept_alive():
-    """With an inactivity timeout in effect, an idle session sends KeepAlive."""
-    captured: dict = {"messages": []}
-    config = {"inactivity_timeout": 0.2}
-    async with serve(_server(captured, configuration=config), "127.0.0.1", 0) as server:
-        await run_test(_service(server), frames_to_send=[SleepFrame(sleep=0.5)])
-
-    assert len(_sent(captured, "KeepAlive")) >= 2
-
-
-@pytest.mark.asyncio
 async def test_expiring_session_is_renewed_between_requests():
     """A session near expires_at is replaced before the next request, keeping the turn."""
     captured: dict = {"messages": []}
@@ -477,11 +487,6 @@ def test_language_enum_maps_to_language_name():
     assert service._settings.language == "german"
 
 
-def test_unsupported_sample_rate_is_rejected():
-    with pytest.raises(ValueError):
-        AssemblyAITTSService(api_key="test-key", sample_rate=11025)
-
-
 def test_voice_and_language_are_left_to_the_server_by_default():
     service = AssemblyAITTSService(api_key="test-key")
     service._sample_rate = 24000
@@ -495,13 +500,13 @@ def test_custom_voice_and_model_are_sent():
         api_key="test-key",
         settings=AssemblyAITTSService.Settings(
             voice_id="01a142a4-66f3-7315-b15f-668b6edfb595",
-            model="assemblyai-tts-mul-4b-2026-10-07",
+            model="assemblyai-tts-1",
         ),
     )
     service._sample_rate = 24000
     query = parse_qs(urlparse(service._build_websocket_url()).query)
     assert query["voice_id"] == ["01a142a4-66f3-7315-b15f-668b6edfb595"]
-    assert query["model_id"] == ["assemblyai-tts-mul-4b-2026-10-07"]
+    assert query["model_id"] == ["assemblyai-tts-1"]
     assert "voice" not in query
     assert "language" not in query
 
@@ -533,7 +538,7 @@ async def test_missing_custom_voice_makes_the_service_unusable():
         "The requested voice was not found.",
         param="voice_id",
     )
-    async with serve(_server(captured, error_after_begin=error), "127.0.0.1", 0) as server:
+    async with serve(_server(captured, error_before_begin=error), "127.0.0.1", 0) as server:
         service = _service(server, settings=AssemblyAITTSService.Settings(voice_id="nobody"))
         _, up_frames = await run_test(service, frames_to_send=[SleepFrame(sleep=0.3)])
 
