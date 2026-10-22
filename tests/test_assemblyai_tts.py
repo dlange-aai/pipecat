@@ -317,14 +317,14 @@ def _error(code: int, error_type: str | None, text: str, **fields) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_rejected_voice_makes_the_service_unusable():
-    """A voice the session can't serve fails the same way on every retry."""
+async def test_missing_voice_makes_the_service_unusable():
+    """A voice that can't be found fails the same way on every retry."""
     captured: dict = {"messages": []}
     error = _error(
-        3006,
-        "invalid_request",
-        "Unsupported voice 'nobody'. Available on this connection: ['jane'].",
-        param="voice",
+        3012,
+        "voice_not_found",
+        "The requested voice was not found.",
+        param="voice_id",
     )
     async with serve(_server(captured, error_before_begin=error), "127.0.0.1", 0) as server:
         service = _service(server, settings=AssemblyAITTSService.Settings(voice="nobody"))
@@ -332,7 +332,7 @@ async def test_rejected_voice_makes_the_service_unusable():
 
     assert not service.is_usable
     errors = [f for f in up_frames if isinstance(f, ErrorFrame)]
-    assert any("3006 invalid_request: Unsupported voice" in f.error for f in errors)
+    assert any("3012 voice_not_found" in f.error for f in errors)
     assert captured["connections"] == 1
 
 
@@ -446,6 +446,17 @@ async def test_begin_limits_size_generate_messages():
 
 
 @pytest.mark.asyncio
+async def test_idle_session_is_kept_alive(monkeypatch):
+    """An idle session sends KeepAlive, since the server closes sessions that go quiet."""
+    monkeypatch.setattr(assemblyai_tts, "KEEPALIVE_INTERVAL_S", 0.1)
+    captured: dict = {"messages": []}
+    async with serve(_server(captured), "127.0.0.1", 0) as server:
+        await run_test(_service(server), frames_to_send=[SleepFrame(sleep=0.35)])
+
+    assert len(_sent(captured, "KeepAlive")) >= 2
+
+
+@pytest.mark.asyncio
 async def test_expiring_session_is_renewed_between_requests():
     """A session near expires_at is replaced before the next request, keeping the turn."""
     captured: dict = {"messages": []}
@@ -470,11 +481,11 @@ async def test_expiring_session_is_renewed_between_requests():
 def test_language_is_sent_when_set():
     service = AssemblyAITTSService(
         api_key="test-key",
-        settings=AssemblyAITTSService.Settings(voice="jane", language=Language.ES),
+        settings=AssemblyAITTSService.Settings(voice="aai-jane", language=Language.ES),
     )
     service._sample_rate = 16000
     query = parse_qs(urlparse(service._build_websocket_url()).query)
-    assert query["voice"] == ["jane"]
+    assert query["voice_id"] == ["aai-jane"]
     assert query["language"] == ["spanish"]
     assert query["sample_rate"] == ["16000"]
 
@@ -491,15 +502,15 @@ def test_voice_and_language_are_left_to_the_server_by_default():
     service = AssemblyAITTSService(api_key="test-key")
     service._sample_rate = 24000
     query = parse_qs(urlparse(service._build_websocket_url()).query)
-    assert "voice" not in query
+    assert "voice_id" not in query
     assert "language" not in query
 
 
-def test_custom_voice_and_model_are_sent():
+def test_cloned_voice_and_model_are_sent():
     service = AssemblyAITTSService(
         api_key="test-key",
         settings=AssemblyAITTSService.Settings(
-            voice_id="01a142a4-66f3-7315-b15f-668b6edfb595",
+            voice="01a142a4-66f3-7315-b15f-668b6edfb595",
             model="assemblyai-tts-1",
         ),
     )
@@ -511,38 +522,7 @@ def test_custom_voice_and_model_are_sent():
     assert "language" not in query
 
 
-def test_voice_id_wins_over_voice():
-    service = AssemblyAITTSService(
-        api_key="test-key",
-        settings=AssemblyAITTSService.Settings(voice="jane", voice_id="support-agent-emma"),
-    )
-    service._sample_rate = 24000
-    query = parse_qs(urlparse(service._build_websocket_url()).query)
-    assert query["voice_id"] == ["support-agent-emma"]
-    assert "voice" not in query
-
-
-def test_voice_id_key_sets_the_custom_voice():
-    delta = AssemblyAITTSService.Settings.from_mapping({"voice_id": "support-agent-emma"})
-    assert delta.voice_id == "support-agent-emma"
-    assert delta.given_fields().keys() == {"voice_id"}
-
-
-@pytest.mark.asyncio
-async def test_missing_custom_voice_makes_the_service_unusable():
-    """A custom voice that can't be found fails the same way on every retry."""
-    captured: dict = {"messages": []}
-    error = _error(
-        3012,
-        "voice_not_found",
-        "The requested voice was not found.",
-        param="voice_id",
-    )
-    async with serve(_server(captured, error_before_begin=error), "127.0.0.1", 0) as server:
-        service = _service(server, settings=AssemblyAITTSService.Settings(voice_id="nobody"))
-        _, up_frames = await run_test(service, frames_to_send=[SleepFrame(sleep=0.3)])
-
-    assert not service.is_usable
-    errors = [f for f in up_frames if isinstance(f, ErrorFrame)]
-    assert any("3012 voice_not_found" in f.error for f in errors)
-    assert captured["connections"] == 1
+def test_voice_id_key_sets_the_voice():
+    """A settings update keyed ``voice_id``, as other services take it, sets the voice."""
+    delta = AssemblyAITTSService.Settings.from_mapping({"voice_id": "aai-mary"})
+    assert delta.voice == "aai-mary"

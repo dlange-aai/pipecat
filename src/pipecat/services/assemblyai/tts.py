@@ -19,7 +19,7 @@ from collections import deque
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from functools import cache
-from typing import Any, ClassVar
+from typing import Any
 from urllib.parse import urlencode
 
 from loguru import logger
@@ -33,7 +33,7 @@ from pipecat.services.tts_service import WebsocketTTSService
 from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.errors import ErrorCategory
 from pipecat.utils.tracing.service_decorators import traced_tts
-from pipecat.utils.types import NOT_GIVEN, NotGiven, is_given
+from pipecat.utils.types import is_given
 
 # Longest text one Generate message accepts, when Begin doesn't report a limit.
 MAX_GENERATE_CHARS = 2000
@@ -42,6 +42,10 @@ MAX_GENERATE_CHARS = 2000
 # most half the session's length. The server stops reading text at expires_at,
 # which would cut off a reply that straddles it.
 SESSION_RENEWAL_MARGIN_S = 120.0
+
+# How often to send KeepAlive. Every session closes after 120 s without a frame
+# either way, and a bot can be silent that long while the user speaks.
+KEEPALIVE_INTERVAL_S = 30.0
 
 # How long to wait, after a turn's last FlushDone, for the WordBoundaries frame
 # that trails it. It is best-effort, so the turn closes without it after this.
@@ -85,21 +89,15 @@ def _ssl_context() -> ssl.SSLContext:
 class AssemblyAITTSSettings(TTSSettings):
     """Settings for AssemblyAITTSService.
 
-    ``voice`` names an AssemblyAI voice and ``language`` the language the
-    session speaks; unset, the server uses its default voice and English.
-    ``model`` names the model, such as ``assemblyai-tts-1``; unset, the
-    session runs on the default model of its language.
-
-    Parameters:
-        voice_id: A cloned voice, by the ID or slug the AssemblyAI dashboard
-            shows, used instead of ``voice``. The session speaks the voice's
-            own language when ``language`` is unset.
+    ``voice`` is the API's ``voice_id``: an AssemblyAI voice by its library
+    slug, such as ``aai-jane``, or a cloned voice by the ID or slug the
+    AssemblyAI dashboard shows. ``language`` is the language the session
+    speaks, and ``model`` names the model, such as ``assemblyai-tts-1``.
+    Unset, the server uses its default voice, the voice's own language (else
+    English) and the default model of that language.
     """
 
-    voice_id: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
-
-    # The base class reads a ``voice_id`` key as ``voice``; here it is its own setting.
-    _aliases: ClassVar[dict[str, str]] = {}
+    pass
 
 
 @dataclass
@@ -138,7 +136,7 @@ class AssemblyAITTSService(WebsocketTTSService):
 
         tts = AssemblyAITTSService(
             api_key=os.getenv("ASSEMBLYAI_API_KEY"),
-            settings=AssemblyAITTSService.Settings(voice=os.getenv("ASSEMBLYAI_VOICE_ID")),
+            settings=AssemblyAITTSService.Settings(voice="aai-jane"),
         )
     """
 
@@ -169,7 +167,7 @@ class AssemblyAITTSService(WebsocketTTSService):
             settings: Runtime-updatable settings.
             **kwargs: Additional arguments passed to the parent WebsocketTTSService.
         """
-        default_settings = self.Settings(model=None, voice=None, voice_id=None, language=None)
+        default_settings = self.Settings(model=None, voice=None, language=None)
         if settings is not None:
             default_settings.apply_update(settings)
 
@@ -186,6 +184,7 @@ class AssemblyAITTSService(WebsocketTTSService):
         self._api_key = api_key
         self._url = url
         self._receive_task: asyncio.Task | None = None
+        self._keepalive_task: asyncio.Task | None = None
 
         # Session state reported by Begin. A session ID means Begin arrived.
         self._session_id: str | None = None
@@ -250,7 +249,7 @@ class AssemblyAITTSService(WebsocketTTSService):
             Dict mapping changed field names to their previous values.
         """
         changed = await super()._update_settings(delta)
-        if changed.keys() & {"voice", "voice_id", "language", "model"}:
+        if changed.keys() & {"voice", "language", "model"}:
             await self._disconnect()
             await self._connect()
         else:
@@ -265,12 +264,9 @@ class AssemblyAITTSService(WebsocketTTSService):
             "encoding": "pcm_s16le",
             "word_boundaries": "true",
         }
-        # Unset values are left to the server's defaults. The server refuses a
-        # session given both voice and voice_id.
-        if is_given(settings.voice_id) and settings.voice_id:
-            params["voice_id"] = settings.voice_id
-        elif settings.voice:
-            params["voice"] = settings.voice
+        # Unset values are left to the server's defaults.
+        if settings.voice:
+            params["voice_id"] = settings.voice
         if is_given(settings.language) and settings.language:
             params["language"] = settings.language
         if is_given(settings.model) and settings.model:
@@ -282,15 +278,20 @@ class AssemblyAITTSService(WebsocketTTSService):
     # ------------------------------------------------------------------
 
     async def _connect(self):
-        """Connect to AssemblyAI and start the receive task."""
+        """Connect to AssemblyAI and start the receive and keepalive tasks."""
         await super()._connect()
         self._reconnect_delay = 0.0
         await self._open_session()
+        if not self._keepalive_task:
+            self._keepalive_task = self.create_task(self._keepalive_task_handler())
 
     async def _disconnect(self):
-        """Disconnect from AssemblyAI and stop the receive task."""
+        """Disconnect from AssemblyAI and stop the receive and keepalive tasks."""
         await super()._disconnect()
         await self.stop_all_metrics()
+        if self._keepalive_task:
+            await self.cancel_task(self._keepalive_task)
+            self._keepalive_task = None
         await self._close_session()
 
     async def _open_session(self):
@@ -395,6 +396,16 @@ class AssemblyAITTSService(WebsocketTTSService):
 
     async def _send(self, message: dict):
         await self._get_websocket().send(json.dumps(message))
+
+    async def _keepalive_task_handler(self):
+        """Keep an idle session open; the receive loop handles a lost one."""
+        while True:
+            await asyncio.sleep(KEEPALIVE_INTERVAL_S)
+            if self._websocket and self._websocket.state is State.OPEN:
+                try:
+                    await self._send({"type": "KeepAlive"})
+                except Exception as e:
+                    logger.debug(f"{self}: error sending KeepAlive: {e}")
 
     # ------------------------------------------------------------------
     # Audio contexts
